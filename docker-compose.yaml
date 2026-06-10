@@ -1,0 +1,10 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    container_name: qr-backend
+    ports:
+      - "${PORT:-4000}:3000"
+    env_file:
+      - .env
