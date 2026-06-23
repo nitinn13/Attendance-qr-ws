@@ -8,7 +8,7 @@ import rateLimit from "express-rate-limit";
  */
 export const verifyRateLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 20,
+  limit: 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: "Too many verification attempts. Please wait a moment and try again." },
