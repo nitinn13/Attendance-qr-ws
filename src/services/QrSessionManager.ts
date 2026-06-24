@@ -5,13 +5,16 @@ import { QrSessionError } from "../utils/errors.js";
 import { fetchTeacherSession, markAttendanceOnMainBackend } from "./mainBackendClient.js";
 import type { ActiveQrSession, PublicQrSession } from "../types/qr.js";
 
+// Extend the InternalSession interface to retain the previous valid token
 interface InternalSession extends ActiveQrSession {
+  previousToken: string | null; // 👈 Holds the token from the immediately preceding 5s window
   interval: NodeJS.Timeout;
   timeout: NodeJS.Timeout;
 }
 
 function toPublic(session: InternalSession): PublicQrSession {
-  const { interval, timeout, ...publicFields } = session;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { interval, timeout, previousToken, ...publicFields } = session;
   return publicFields;
 }
 
@@ -20,22 +23,14 @@ async function buildQrImage(payload: { qrToken: string; token: string; sessionId
 }
 
 /**
- * Manages live QR attendance runs entirely in memory, keyed by the
- * main backend's Session.id. Multiple teachers/classes can run QR
- * attendance concurrently without interfering with each other.
- *
- * This class owns no persistence and no user identity — it only knows
- * how to rotate tokens and recognize a valid scan against the
- * currently displayed token. Identity and attendance writes are
- * delegated to the main backend.
+ * Manages live QR attendance runs entirely in memory with a sliding-window
+ * grace period buffer to prevent edge-case race conditions for students.
  */
 export class QrSessionManager {
   private sessions = new Map<number, InternalSession>();
 
   /**
-   * Start a new QR run for a given session. Confirms with the main
-   * backend (using the teacher's own JWT) that the session exists,
-   * belongs to that teacher, and is open for attendance.
+   * Start a new QR run for a given session.
    */
   async startSession(sessionId: number, teacherAuthToken: string): Promise<PublicQrSession> {
     const remoteSession = await fetchTeacherSession(sessionId, teacherAuthToken);
@@ -70,6 +65,7 @@ export class QrSessionManager {
       classId: remoteSession.classId,
       className: remoteSession.className,
       currentToken: token,
+      previousToken: null, // 👈 Starts as null since there is no preceding code yet
       qrImage,
       expiresAt,
       startedAt,
@@ -111,10 +107,7 @@ export class QrSessionManager {
   }
 
   /**
-   * Verify a scan and, if valid, ask the main backend to record
-   * attendance using the student's own forwarded JWT. The student's
-   * identity is never known to this service beyond "owner of this
-   * Authorization header" — the main backend resolves and authorizes it.
+   * Verify a scan with sliding-window evaluation.
    */
   async verifyAndMarkAttendance(
     sessionId: number,
@@ -128,12 +121,20 @@ export class QrSessionManager {
       throw new QrSessionError("No active QR session for this class");
     }
 
-    if (session.qrToken !== qrToken || session.currentToken !== token) {
+    // 1. Verify the static base session token matches
+    if (session.qrToken !== qrToken) {
+      throw new QrSessionError("This QR code belongs to an expired session context");
+    }
+
+    // 2. 👇 SLIDING WINDOW MATCH: Allow match if it targets current OR previous rolling token
+    const isCurrentTokenValid = session.currentToken === token;
+    const isPreviousTokenValid = session.previousToken !== null && session.previousToken === token;
+
+    if (!isCurrentTokenValid && !isPreviousTokenValid) {
       throw new QrSessionError("This QR code has expired — please scan the current one");
     }
 
-    // Delegate the actual write (and all of its checks: enrollment,
-    // session-open, no-duplicate) to the main backend.
+    // Delegate the actual write to the main backend.
     return markAttendanceOnMainBackend(sessionId, studentAuthToken);
   }
 
@@ -144,6 +145,9 @@ export class QrSessionManager {
     return this.sessions.size;
   }
 
+  /**
+   * Rotates tokens smoothly every 5 seconds, sliding the old one into grace period buffer.
+   */
   private async rotateToken(sessionId: number): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -155,6 +159,9 @@ export class QrSessionManager {
       sessionId,
     });
 
+    // 👇 Slide current token back into the previous token slot
+    session.previousToken = session.currentToken;
+    // Set the brand new token as active
     session.currentToken = newToken;
     session.qrImage = newImage;
   }
